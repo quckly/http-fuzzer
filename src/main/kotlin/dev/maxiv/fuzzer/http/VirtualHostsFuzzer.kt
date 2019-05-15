@@ -6,6 +6,7 @@ import io.ktor.client.call.call
 import io.ktor.client.engine.apache.Apache
 import io.ktor.client.response.readText
 import io.ktor.http.HttpMethod
+import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.*
 import org.apache.http.config.RegistryBuilder
@@ -25,7 +26,9 @@ import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.SSLContext
 
 data class VirtualHostTestResult(val virtualHost: String,
-                                 val responseContent: String)
+                                 val responseContent: String,
+                                 val responseStatus: HttpStatusCode,
+                                 val success: Boolean = true)
 
 @ExperimentalCoroutinesApi
 class VirtualHostsFuzzer(
@@ -39,7 +42,8 @@ class VirtualHostsFuzzer(
     val thresholdMultiplier: Double = 0.9,
     val randomHostsCount: Int = 5,
     val randomHostsLength: Int = 10,
-    val maxConnections: Int = 10
+    val maxConnections: Int = 50,
+    val debugEnabled: Boolean = false
 ) {
 
     // https://github.com/tdebatty/java-string-similarity#shingle-n-gram-based-algorithms
@@ -49,21 +53,12 @@ class VirtualHostsFuzzer(
         runBlocking {
             // Generate randoms string and calculate distance in not-existing hosts
             val responses: List<VirtualHostTestResult> = produceRandomStrings(randomHostsCount, randomHostsLength)
-                .map {
-                    val result = GlobalScope.async { testSubDomain(it) }
-                    println("$it started")
-                    result
-                }
+                .map { GlobalScope.async { testSubDomain(it) } }
                 .toList() // Start iteration above all items in previously map
-                .map {
-                    val result = it.await()
-                    println("${result.virtualHost} finished")
-                    result
-                } // Wait for all results
-                //resp//.second.replace(resp.first, "") // Remove subdomain mention
+                .map { it.await() } // Wait for all results
                 .toList()
 
-            val responseToCheckSimilarity = responses[0].responseContent
+            val responseToCheckSimilarity = responses[0]
 
             var maximumSimilarity = 1.0
 
@@ -75,7 +70,9 @@ class VirtualHostsFuzzer(
                         maximumSimilarity = similarity
                     }
 
-                    //println("Similarity of ${i.first} and ${j.first} = $similarity")
+                    if (debugEnabled) {
+                        println("Similarity of ${i.virtualHost} and ${j.virtualHost} = $similarity")
+                    }
                 }
             }
 
@@ -83,31 +80,37 @@ class VirtualHostsFuzzer(
             maximumSimilarity *= thresholdMultiplier
 
             println("Similarity threshold is $maximumSimilarity")
+            if (!isOkStatusCode(responseToCheckSimilarity.responseStatus)) {
+                println("Not existed virtual hosts have ${responseToCheckSimilarity.responseStatus.value} ${responseToCheckSimilarity.responseStatus.description} status code.")
+            }
             println("Founded virtual hosts:")
 
             val jobsList = mutableListOf<Job>()
 
             for (testItem in dictionary) {
+                // TODO: Launch sequentially
                 jobsList.add(GlobalScope.launch {
-                    val (target, response) = run {
-                        testSubDomain(testItem)
+                    val result = testSubDomain(testItem)
+
+                    if (!result.success) {
+                        return@launch
                     }
 
-                    // TODO: Debug
-                    println("Testing of $testItem is started")
+                    val similarity = getSimilarity(responseToCheckSimilarity.responseContent, result.responseContent)
 
-                    //println("$target -> $response")
-
-                    val similarity = getSimilarity(responseToCheckSimilarity, response)
-
-                    if (similarity < maximumSimilarity) {
+                    // First compare status codes
+                    // after compare content similarity
+                    if (responseToCheckSimilarity.responseStatus != result.responseStatus ||
+                        similarity < maximumSimilarity) {
                         // New virtual host found
 
                         println("Virtual Host found: $testItem ($similarity)")
                     }
 
                     // TODO: Debug
-                    println("Testing of $testItem is finished")
+                    if (debugEnabled) {
+                        println("Testing of $testItem is finished")
+                    }
                 })
             }
 
@@ -125,15 +128,21 @@ class VirtualHostsFuzzer(
                 method = HttpMethod.parse(this@VirtualHostsFuzzer.method)
             }
 
-            return VirtualHostTestResult(testItem, call.response.readText())
+            return VirtualHostTestResult(testItem, call.response.readText(), call.response.status)
         } catch (e: Exception) {
             // TODO: Add exception handler
-            throw e
+            System.err.println("Error on $testItem: $e")
+            return VirtualHostTestResult(testItem, "", HttpStatusCode.Conflict, false)
+            //throw e
         }
     }
 
     private fun getSimilarity(str1: String, str2: String): Double =
         if (str1 == str2) 1.0 else similarityComputer.similarity(str1, str2)
+
+    private fun isOkStatusCode(statusCode: HttpStatusCode): Boolean {
+        return statusCode.value in 200..299
+    }
 
     fun CoroutineScope.produceRandomStrings(count: Int, length: Int): ReceiveChannel<String> = produce {
         val charPool: List<Char> = ('a'..'z') + ('A'..'Z')// + ('0'..'9')
@@ -165,7 +174,7 @@ class VirtualHostsFuzzer(
             // For timeouts: 0 means infinite, while negative value mean to use the system's default value
             socketTimeout = 10_000  // Max time between TCP packets - default 10 seconds
             connectTimeout = 10_000 // Max time to establish an HTTP connection - default 10 seconds
-            connectionRequestTimeout = 20_000 // Max time for the connection manager to start a request - 20 seconds
+            connectionRequestTimeout = -1//20_000 // Max time for the connection manager to start a request - 20 seconds
 
             customizeClient {
                 // Accept all TLS certificates
@@ -197,7 +206,7 @@ class VirtualHostsFuzzer(
     }
 
     companion object {
-        private const val MAX_CONNECTIONS_COUNT = 1000
+        //private const val MAX_CONNECTIONS_COUNT = 1000
         private const val IO_THREAD_COUNT_DEFAULT = 4
 
         fun createNHttpClientConnectionManager(
@@ -228,7 +237,7 @@ class VirtualHostsFuzzer(
             )
 
             poolingmgr.maxTotal = maxConnections
-            poolingmgr.defaultMaxPerRoute = 100
+            poolingmgr.defaultMaxPerRoute = maxConnections
 
             return poolingmgr
         }

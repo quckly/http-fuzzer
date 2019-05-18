@@ -60,14 +60,14 @@ class VirtualHostsFuzzer(
 
             val responseToCheckSimilarity = responses[0]
 
-            var maximumSimilarity = 1.0
+            var minimumSimilarity = 1.0
 
             for (i in responses) {
                 for (j in responses) {
                     val similarity = getSimilarity(i.responseContent, j.responseContent)
 
-                    if (similarity > maximumSimilarity) {
-                        maximumSimilarity = similarity
+                    if (similarity < minimumSimilarity) {
+                        minimumSimilarity = similarity
                     }
 
                     if (debugEnabled) {
@@ -77,9 +77,9 @@ class VirtualHostsFuzzer(
             }
 
             // Move the upper limit of similarity down
-            maximumSimilarity *= thresholdMultiplier
+            minimumSimilarity *= thresholdMultiplier
 
-            println("Similarity threshold is $maximumSimilarity")
+            println("Similarity threshold is $minimumSimilarity")
             if (!isOkStatusCode(responseToCheckSimilarity.responseStatus)) {
                 println("Not existed virtual hosts have ${responseToCheckSimilarity.responseStatus.value} ${responseToCheckSimilarity.responseStatus.description} status code.")
             }
@@ -101,7 +101,7 @@ class VirtualHostsFuzzer(
                     // First compare status codes
                     // after compare content similarity
                     if (responseToCheckSimilarity.responseStatus != result.responseStatus ||
-                        similarity < maximumSimilarity) {
+                        similarity < minimumSimilarity) {
                         // New virtual host found
 
                         println("Virtual Host found: $testItem ($similarity)")

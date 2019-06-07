@@ -9,6 +9,7 @@ import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.*
+import kotlinx.coroutines.selects.select
 import org.apache.http.config.RegistryBuilder
 import org.apache.http.conn.DnsResolver
 import org.apache.http.impl.conn.SystemDefaultDnsResolver
@@ -22,6 +23,7 @@ import org.apache.http.nio.conn.ssl.SSLIOSessionStrategy
 import org.apache.http.ssl.SSLContextBuilder
 import java.lang.Exception
 import java.net.InetAddress
+import java.util.concurrent.TimeUnit
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.SSLContext
 
@@ -53,7 +55,7 @@ class VirtualHostsFuzzer(
         runBlocking {
             // Generate randoms string and calculate distance in not-existing hosts
             val responses: List<VirtualHostTestResult> = produceRandomStrings(randomHostsCount, randomHostsLength)
-                .map { GlobalScope.async { testSubDomain(it) } }
+                .map { async { testSubDomain(it) } }
                 .toList() // Start iteration above all items in previously map
                 .map { it.await() } // Wait for all results
                 .toList()
@@ -85,35 +87,63 @@ class VirtualHostsFuzzer(
             }
             println("Founded virtual hosts:")
 
-            val jobsList = mutableListOf<Job>()
+            val jobsList = mutableSetOf<Job>()
 
-            for (testItem in dictionary) {
-                // TODO: Launch sequentially
-                jobsList.add(GlobalScope.launch {
-                    val result = testSubDomain(testItem)
+            for ((idx, testItem) in dictionary.withIndex()) {
+                var createdJob = false
+                while (!createdJob) {
+                    if (jobsList.size < maxConnections) {
+                        jobsList.add(launch {
+                            val result = testSubDomain(testItem)
 
-                    if (!result.success) {
-                        return@launch
+                            if (!result.success) {
+                                return@launch
+                            }
+
+                            val similarity =
+                                getSimilarity(responseToCheckSimilarity.responseContent, result.responseContent)
+
+                            // First compare status codes
+                            // after compare content similarity
+                            if (responseToCheckSimilarity.responseStatus != result.responseStatus ||
+                                similarity < minimumSimilarity
+                            ) {
+                                // New virtual host found
+                                println("Found: $testItem ($similarity)")
+                            }
+
+                            // TODO: Debug
+                            if (debugEnabled) {
+                                println("Testing of $testItem is finished")
+                            }
+                        })
+
+                        createdJob = true
+                    } else {
+                        // Wait when at least one job will be completed
+                        val completedJob = select<Job> {
+                            jobsList.forEach {
+                                it.onJoin {
+                                    it
+                                }
+                            }
+                        }
+
+                        // Remove completed Jobs
+                        val jobsToRemove = jobsList.filter { it.isCompleted }
+                        jobsToRemove.forEach {
+                            it.join()
+                            jobsList.remove(it)
+                        }
+
+                        // Remove memory leak in routes
+                        //clientConnManager.closeExpiredConnections()
+                        //clientConnManager.closeIdleConnections(5, TimeUnit.SECONDS)
                     }
-
-                    val similarity = getSimilarity(responseToCheckSimilarity.responseContent, result.responseContent)
-
-                    // First compare status codes
-                    // after compare content similarity
-                    if (responseToCheckSimilarity.responseStatus != result.responseStatus ||
-                        similarity < minimumSimilarity) {
-                        // New virtual host found
-
-                        println("Virtual Host found: $testItem ($similarity)")
-                    }
-
-                    // TODO: Debug
-                    if (debugEnabled) {
-                        println("Testing of $testItem is finished")
-                    }
-                })
+                }
             }
 
+            // Wait last tasks
             jobsList.forEach { it.join() }
 
             println("Virtual Hosts Fuzzing is finished.")
@@ -128,7 +158,13 @@ class VirtualHostsFuzzer(
                 method = HttpMethod.parse(this@VirtualHostsFuzzer.method)
             }
 
-            return VirtualHostTestResult(testItem, call.response.readText(), call.response.status)
+            val responseContent = call.response.readText()
+            val responseStatus = call.response.status
+
+            // Important to close call
+            call.close()
+
+            return VirtualHostTestResult(testItem, responseContent, responseStatus)
         } catch (e: Exception) {
             // TODO: Add exception handler
             System.err.println("Error on $testItem: $e")
@@ -164,6 +200,8 @@ class VirtualHostsFuzzer(
         }
     }
 
+    lateinit var clientConnManager: NHttpClientConnectionManager
+
     val client = HttpClient(Apache) {
         followRedirects = false
 
@@ -181,18 +219,22 @@ class VirtualHostsFuzzer(
                 val builder = SSLContextBuilder()
                 builder.loadTrustMaterial(null, { chain, authType -> true })
                 val sslContext1 = builder.build()
+                // For sun.security.ssl.SSLSessionContextImpl sun.security.util.MemoryCache
+                // Remove memory leak
+                sslContext1.clientSessionContext.sessionCacheSize = 1
+                sslContext1.clientSessionContext.sessionTimeout = 1
                 setSSLContext(sslContext1)
                 //setSSLHostnameVerifier(org.apache.http.conn.ssl.NoopHostnameVerifier.INSTANCE)
                 val hostnameVerifier = HostnameVerifier { s, sslSession -> true }
                 setSSLHostnameVerifier(hostnameVerifier)
 
                 // Change DNS Resolver and SSL
-                val connmgr = createNHttpClientConnectionManager(hostnameVerifier, sslContext1, dnsResolver, maxConnections)
-                setConnectionManager(connmgr)
+                clientConnManager = createNHttpClientConnectionManager(hostnameVerifier, sslContext1, dnsResolver, maxConnections)
+                setConnectionManager(clientConnManager)
 
                 // From io.ktor.client.engine.apache.ApacheEngine
-                setMaxConnPerRoute(maxConnections)
                 setMaxConnTotal(maxConnections)
+                setMaxConnPerRoute(1)
 
                 // Change User-Agent
                 setUserAgent(userAgent)
@@ -224,6 +266,8 @@ class VirtualHostsFuzzer(
             )
             val ioreactor = DefaultConnectingIOReactor(IOReactorConfig.custom().apply {
                 setIoThreadCount(IO_THREAD_COUNT_DEFAULT)
+                setSoKeepAlive(false)
+                setSoReuseAddress(false)
             }.build())
 
             val poolingmgr = PoolingNHttpClientConnectionManager(
@@ -237,7 +281,7 @@ class VirtualHostsFuzzer(
             )
 
             poolingmgr.maxTotal = maxConnections
-            poolingmgr.defaultMaxPerRoute = maxConnections
+            poolingmgr.defaultMaxPerRoute = 1
 
             return poolingmgr
         }
